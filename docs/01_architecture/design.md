@@ -546,14 +546,133 @@ curl -X GET "http://localhost:8080/context/v1/query?agent_id=agent_001&session_i
 
 **预置配置说明**：
 
-系统首次启动时会从配置中心加载并缓存以下预置数据：
+系统首次启动时会从本上下文服务的配置文件中加载并缓存以下预置数据，**同时为每个 Agent 在数据库中创建默认实例模板**。
 
-| 预置数据 | 内容说明 | 配置时机 |
-|----------|----------|----------|
-| **工作流配置** | Agent类型的标准执行流程、步骤依赖关系 | 系统启动时 |
-| **模型编排节点** | 模型调用顺序、策略、fallback配置、超时重试参数 | 系统启动时 |
-| **Prompt模板** | System Prompt、User Prompt、Model Specific Prompts | 系统启动时 |
-| **槽位参数定义** | 输入参数、动态参数、输出参数的定义和校验规则 | 系统启动时 |
+**配置文件目录结构**：
+
+```
+/config
+├── agents/                          # Agent配置文件目录
+│   ├── sys_agent.yaml              # SysAgent配置
+│   ├── qa_agent.yaml               # 问答Agent配置
+│   ├── travel_agent.yaml           # 旅游Agent配置
+│   ├── shopping_agent.yaml         # 购物Agent配置
+│   └── movie_agent.yaml            # 电影Agent配置
+├── templates/                       # Prompt模板目录
+│   ├── system/                     # System Prompt模板
+│   │   ├── intent_recognition_sys_v1.txt
+│   │   └── answer_generation_sys_v1.txt
+│   └── user/                       # User Prompt模板
+│       ├── intent_recognition_user_v1.txt
+│       └── answer_generation_user_v1.txt
+└── global.yaml                     # 全局配置
+```
+
+**配置加载规则**：
+- 服务启动时扫描 `/config/agents/` 目录下所有 `.yaml` 文件
+- 每个 AgentType 对应一个独立的配置文件
+- 配置文件名格式：`{agenttype}.yaml`
+- 配置文件变更后需重启服务生效（或调用热更新接口）
+
+**预置数据内容**：
+
+| 预置数据 | 内容说明 | 配置时机 | 配置文件位置 |
+|----------|----------|----------|--------------|
+| **工作流配置** | Agent类型的标准执行流程、步骤依赖关系 | 系统启动时 | `/config/agents/{agenttype}.yaml` |
+| **模型编排节点** | 模型调用顺序、策略、fallback配置、超时重试参数 | 系统启动时 | `/config/agents/{agenttype}.yaml` |
+| **Prompt模板** | System Prompt、User Prompt、Model Specific Prompts | 系统启动时 | `/config/agents/{agenttype}.yaml` + `/config/templates/` |
+| **槽位参数定义** | 输入参数、动态参数、输出参数的定义和校验规则 | 系统启动时 | `/config/agents/{agenttype}.yaml` |
+
+**默认实例模板创建（服务启动时）**：
+
+服务启动时，读取配置文件后，将配置内容解析并插入数据库 `context_template` 表作为默认模板：
+
+```python
+# 伪代码：服务启动时从配置文件加载并创建模板
+config = load_yaml(f"/config/agents/{agenttype}.yaml")
+
+# 1. 插入 Agent 模板
+agent_template_id = f"agent_{agenttype}_template"
+insert_context_template(
+    id=agent_template_id,
+    level="agent",
+    agenttype=agenttype,
+    agent_id=f"{agenttype}_template",
+    version="1.0"
+)
+
+# 2. 插入 Session 模板
+session_template_id = f"sess_{agenttype}_template"
+insert_context_template(
+    id=session_template_id,
+    level="session",
+    agenttype=agenttype,
+    agent_id=f"{agenttype}_template",
+    session_id="template",
+    session_name="默认会话模板",
+    version="1.0"
+)
+
+# 3. 插入 Task 模板
+task_template_id = f"task_{agenttype}_template"
+insert_context_template(
+    id=task_template_id,
+    level="task",
+    agenttype=agenttype,
+    agent_id=f"{agenttype}_template",
+    session_id="template",
+    task_id="template",
+    task_type="default",
+    task_name="默认任务模板",
+    version="1.0"
+)
+
+# 4. 遍历 workflow nodes，插入 Node 模板
+for node in config.workflow.nodes:
+    node_template_id = f"node_task_{agenttype}_template_{node.node_id}"
+    insert_context_template(
+        id=node_template_id,
+        level="node",
+        agenttype=agenttype,
+        agent_id=f"{agenttype}_template",
+        session_id="template",
+        task_id="template",
+        node_order=node.order,
+        node_type=node.node_type,
+        model_config=json.dumps(node),  # 存储完整node配置
+        system_prompt=node.system_prompt.content,
+        user_prompt=node.user_prompt.content,
+        version="1.0"
+    )
+```
+
+**对应 SQL 语句**：
+
+```sql
+-- 插入 Agent 模板（从配置文件解析）
+INSERT INTO context_template (id, level, agenttype, agent_id, version)
+VALUES ('agent_{agenttype}_template', 'agent', '{agenttype}', '{agenttype}_template', '1.0');
+
+-- 插入 Session 模板（从配置文件解析）
+INSERT INTO context_template (id, level, agenttype, agent_id, session_id, session_name, version)
+VALUES ('sess_{agenttype}_template', 'session', '{agenttype}', '{agenttype}_template', 'template', '默认会话模板', '1.0');
+
+-- 插入 Task 模板（从配置文件解析）
+INSERT INTO context_template (id, level, agenttype, agent_id, session_id, task_id, task_type, task_name, version)
+VALUES ('task_{agenttype}_template', 'task', '{agenttype}', '{agenttype}_template', 'template', 'template', 'default', '默认任务模板', '1.0');
+
+-- 基于 workflow.nodes 配置插入 Node 模板（从配置文件解析每个node）
+INSERT INTO context_template (id, level, agenttype, agent_id, session_id, task_id,
+    node_order, node_type, model_config, system_prompt, user_prompt, version)
+VALUES ('node_task_{agenttype}_template_{node_id}', 'node', '{agenttype}', '{agenttype}_template',
+    'template', 'template', {node.order}, '{node.node_type}',
+    '{node_config_json}', '{node.system_prompt.content}', '{node.user_prompt.content}', '1.0');
+```
+
+**模板用途**：
+- 作为新实例创建的**复制源**，避免每次从配置文件重新解析
+- 缓存已渲染的 Prompt 模板和模型配置
+- 加速实例创建流程（直接从模板表复制，而非配置文件解析）
 
 
 **核心流程**：
@@ -580,96 +699,169 @@ curl -X GET "http://localhost:8080/context/v1/query?agent_id=agent_001&session_i
 
 #### 步骤2：解析验证
 - 解析请求参数，提取 agent_id、session_id、task_id、agenttype
-- 验证 agenttype 对应的预置配置是否已加载（从配置库中查询）
+- 验证 agenttype 对应的预置配置是否已加载（检查内存中的配置缓存）
 - 校验调用方权限（API Key 验证）
 - 若 task_id 为空，创建 session 级实例；否则创建 task 级实例
 
 #### 步骤3：加载预置配置
-从配置存储加载以下配置：
+从本地配置文件加载对应 agenttype 的配置：
 
-| 配置项 | 存储位置 | 说明 |
-|--------|----------|------|
-| 模型编排配置 | `agent_config.model_orchestration` | 模型调用链配置、路由规则 |
-| Prompt模板库 | `agent_config.prompt_templates` | System Prompt、User Prompt、Model Specific Prompts |
-| 参数定义 | `agent_config.parameters` | 输入参数、动态参数、输出参数定义 |
-| WorkFlow配置 | `agent_config.workflow` | 工作流步骤、依赖关系 |
-| 上下文槽位定义 | `agent_config.context_slots` | session、memory、tool 槽位配置 |
+| 配置项 | 配置文件路径 | 说明 |
+|--------|--------------|------|
+| 模型编排配置 | `/config/agents/{agenttype}.yaml` | 模型调用链配置、路由规则 |
+| Prompt模板库 | `/config/agents/{agenttype}.yaml` + `/config/templates/` | System Prompt、User Prompt、Model Specific Prompts |
+| 参数定义 | `/config/agents/{agenttype}.yaml` | 输入参数、动态参数、输出参数定义 |
+| WorkFlow配置 | `/config/agents/{agenttype}.yaml` | 工作流步骤、依赖关系 |
+| 上下文槽位定义 | `/config/agents/{agenttype}.yaml` | session、memory、tool 槽位配置 |
 
-#### 步骤4：构建实例
-创建上下文实例对象并初始化各组件：
+**配置加载流程**：
+1. 根据 `agenttype` 确定配置文件路径（如 `/config/agents/qa_agent.yaml`）
+2. 从内存缓存中读取已加载的配置（服务启动时已预加载）
+3. 若缓存未命中，实时读取配置文件并解析
+4. 将配置内容绑定到当前实例构建上下文
 
-**4.1 创建基础实例信息**
-- 生成 instance_id（UUID格式）
-- 设置 level 字段：agent/session/task/node
-- 绑定业务标识：agent_id、session_id、task_id
+#### 步骤4：基于默认模板创建实例记录
+上下文服务启动时，已为每个 Agent 在数据库中创建了**默认实例模板**。收到创建实例请求后，基于该模板复制出新的实例记录：
 
-**4.2 初始化模型调用链状态**
-```json
-{
-  "model_chain": {
-    "current_model_index": 0,
-    "models": [
-      {
-        "order": 1,
-        "model_id": "gpt-4",
-        "status": "pending",
-        "invocation_count": 0,
-        "last_invoked_at": null
-      }
-    ]
-  }
-}
+**默认实例模板结构（创建时参考）**：
+```
+默认Agent模板 (level=agent, id=agent_{agenttype}_template)
+├── 默认Session模板 (level=session)
+│   └── 默认Task模板 (level=task)
+│       ├── Node模板-意图识别 (level=node)
+│       └── Node模板-答案生成 (level=node)
 ```
 
-**4.3 应用Prompt模板**
-- **System Prompt**：使用预置动态参数即时渲染，存储到 `system_prompt` 字段
-- **User Prompt**：保持模板形式，存储到 `user_prompt` 字段，等待用户输入后渲染
-- **Model Specific Prompts**：绑定到对应模型节点配置中
+**4.1 复制 Agent 层级记录**
+基于默认模板，插入新的 Agent 实例记录：
 
-**4.4 实例化参数槽位**
+```sql
+INSERT INTO context_instance (
+    id, level, agenttype, agent_id, current_session_id, status, template_id, template_version, created_at, updated_at
+)
+SELECT
+    'agent_{agent_id}',              -- 新生成的Agent实例ID
+    'agent',
+    agenttype,
+    '{agent_id}',                    -- 请求中的agent_id
+    'sess_{agent_id}_{session_id}',  -- 新session ID
+    'active',
+    id,                              -- 来源模板ID
+    version,                         -- 来源模板版本
+    NOW(), NOW()
+FROM context_template
+WHERE id = 'agent_{agenttype}_template' AND level = 'agent';
+```
+
+**4.2 复制 Session 层级记录**
+基于默认模板，插入新的 Session 实例记录：
+
+```sql
+INSERT INTO context_instance (
+    id, level, agent_id, session_id, session_name, status, template_id, template_version, created_at, updated_at
+)
+SELECT
+    'sess_{agent_id}_{session_id}',  -- 新生成的Session ID
+    'session',
+    '{agent_id}',
+    '{session_id}',                  -- 请求中的session_id
+    COALESCE(NULLIF('{session_name}', ''), session_name, '新会话'),
+    'active',
+    id,
+    version,
+    NOW(), NOW()
+FROM context_template
+WHERE agenttype = '{agenttype}' AND level = 'session' AND session_id = 'template';
+```
+
+**4.3 复制 Task 层级记录**
+基于默认模板，插入新的 Task 实例记录：
+
+```sql
+INSERT INTO context_instance (
+    id, level, agent_id, session_id, task_id, task_type, task_name, status, template_id, template_version, created_at, updated_at
+)
+SELECT
+    'task_{agent_id}_{session_id}_{task_id}',  -- 新生成的Task ID
+    'task',
+    '{agent_id}',
+    '{session_id}',
+    COALESCE('{task_id}', 'task_default'),     -- 请求中的task_id或默认值
+    task_type,
+    task_name,
+    'active',
+    id,
+    version,
+    NOW(), NOW()
+FROM context_template
+WHERE agenttype = '{agenttype}' AND level = 'task' AND task_id = 'template';
+```
+
+**4.4 复制 Node 层级记录**
+基于默认模板中的 nodes 配置，批量复制 Node 实例记录：
+
+```sql
+INSERT INTO context_instance (
+    id, level, agent_id, session_id, task_id,
+    node_order, node_type, model_config,
+    system_prompt, user_prompt, status, template_id, template_version, created_at, updated_at
+)
+SELECT
+    'node_task_{agent_id}_{session_id}_{task_id}_' || SUBSTRING_INDEX(id, '_', -1),  -- 从模板ID提取node_id
+    'node',
+    '{agent_id}',
+    '{session_id}',
+    COALESCE('{task_id}', 'task_default'),
+    node_order,
+    node_type,
+    model_config,           -- 复制完整的模型配置（含context_requirements等）
+    system_prompt,          -- 复制System Prompt模板
+    user_prompt,            -- 复制User Prompt模板
+    'pending',              -- 初始状态
+    id,                     -- 来源模板ID
+    version,                -- 来源模板版本
+    NOW(), NOW()
+FROM context_template
+WHERE agenttype = '{agenttype}' AND level = 'node' AND task_id = 'template';
+```
+
+**复制时的字段映射规则**：
+
+| 模板字段 | 新实例字段 | 处理方式 |
+|----------|------------|----------|
+| 模板ID | 新实例ID | 替换为 `{agent_id}_{session_id}_{task_id}` 格式 |
+| agenttype | agenttype | 保持不变 |
+| agent_id | agent_id | 使用请求中的 agent_id |
+| session_id | session_id | 使用请求中的 session_id |
+| task_id | task_id | 使用请求中的 task_id 或生成默认值 |
+| system_prompt | system_prompt | 复制模板内容（支持变量渲染） |
+| user_prompt | user_prompt | 复制模板内容 |
+| model_config | model_config | 完整复制（含workflow、槽位定义等） |
+| status | status | 重置为 active/pending |
+
+**4.5 初始化实例参数槽位**
+从模板的槽位定义初始化空值：
+
 ```json
 {
   "parameter_values": {
-    "input": {},      // 验证必填项，设置默认值
-    "dynamic": {},    // 标记数据源（配置库、知识库、上下文）
-    "output": {}      // 预留结果存储位置
-  }
-}
-```
-
-**4.5 加载上下文槽位定义**
-```json
-{
+    "input": {},           -- 等待用户请求填充
+    "dynamic": {},         -- 运行时动态计算
+    "output": {}           -- 模型执行后填充
+  },
   "context_slots": {
     "session_context": {"status": "empty", "data": {}, "token_count": 0},
     "memory_context": {"status": "empty", "data": {}, "retrieved_memories": []},
     "tool_context": {"status": "empty", "data": {}}
-  }
+  },
+  "template_reference": "agent_{agenttype}_template"  -- 记录模板来源
 }
 ```
 
-#### 步骤5：持久化存储
-将实例数据写入 RAG 服务的 `context_instance` 表：
+#### 步骤5：通知下游
+实例创建完成后，通知相关模块进行后续处理：
 
-| 表字段 | 填充值 |
-|--------|--------|
-| id | 生成的 instance_id |
-| level | agent/session/task/node |
-| agenttype | 请求中的 agenttype |
-| agent_id | 请求中的 agent_id |
-| session_id | 请求中的 session_id |
-| task_id | 请求中的 task_id（如有）|
-| status | active |
-| system_prompt | 渲染后的 System Prompt |
-| user_prompt | User Prompt 模板 |
-| dynamic_params | 动态参数JSON |
-| model_config | 模型配置JSON |
-| created_at | 当前时间戳 |
-| updated_at | 当前时间戳 |
-
-#### 步骤6：通知下游
 - **通知上下文组装模块**：触发预装填流程（加载session上下文、召回记忆）
-- **通知缓存模块**：初始化分布式缓存（Redis）和本地缓存
 
 **数据模型**：
 
@@ -692,6 +884,18 @@ curl -X GET "http://localhost:8080/context/v1/query?agent_id=agent_001&session_i
         "name": "意图识别",
         "description": "分析用户query，识别意图和槽位",
         "order": 1,
+
+        "system_prompt": {
+          "template_id": "intent_recognition_sys_v1",
+          "content": "你是一个专业的意图识别助手。请分析用户的输入，识别出用户的意图和关键槽位信息。\n\n注意事项：\n1. 意图分类必须在预定义的分类列表中\n2. 槽位提取要准确，缺失的槽位标记为null\n3. 返回格式必须是合法的JSON",
+          "variables": []
+        },
+
+        "user_prompt": {
+          "template_id": "intent_recognition_user_v1",
+          "content": "用户输入：{{user_original_query}}\n\n请识别用户意图并提取槽位，以JSON格式返回：\n{\n  \"intent\": \"意图分类\",\n  \"slots\": {\n    \"槽位名\": \"槽位值\"\n  },\n  \"confidence\": 0.95\n}",
+          "variables": ["user_original_query"]
+        },
 
         "context_requirements": {
           "required_slots": [
@@ -730,12 +934,6 @@ curl -X GET "http://localhost:8080/context/v1/query?agent_id=agent_001&session_i
           "history_messages": "{{history_messages}}"
         },
 
-        "output_mapping": {
-          "intent": "output.intent",
-          "slots": "output.slots",
-          "confidence": "output.confidence"
-        },
-
         "next_nodes": {
           "default": "answer_generation"
         }
@@ -748,7 +946,17 @@ curl -X GET "http://localhost:8080/context/v1/query?agent_id=agent_001&session_i
         "order": 2,
         "dependencies": ["intent_recognition"],
 
+        "system_prompt": {
+          "template_id": "answer_generation_sys_v1",
+          "content": "你是一个专业的问答助手。基于用户的原始问题、识别出的意图和相关上下文信息，生成准确、有帮助的回答。\n\n回答要求：\n1. 回答要直接针对用户的问题\n2. 可以引用提供的历史对话和记忆信息\n3. 如果不确定，请诚实说明\n4. 保持友好、专业的语气",
+          "variables": ["intent", "memories"]
+        },
 
+        "user_prompt": {
+          "template_id": "answer_generation_user_v1",
+          "content": "用户问题：{{user_original_query}}\n\n识别意图：{{intent}}\n\n{% if memories %}\n相关记忆：\n{{memories}}\n{% endif %}\n\n{% if history_messages %}\n历史对话：\n{{history_messages}}\n{% endif %}\n\n请根据以上信息生成回答：",
+          "variables": ["user_original_query", "intent", "memories", "history_messages"]
+        },
 
         "context_requirements": {
           "required_slots": [
@@ -785,12 +993,6 @@ curl -X GET "http://localhost:8080/context/v1/query?agent_id=agent_001&session_i
           "intent": "{{intent}}",
           "history": "{{history_messages}}",
           "memories": "{{memory_context}}"
-        },
-
-        "output_mapping": {
-          "answer": "output.content",
-          "citations": "output.citations",
-          "confidence": "output.confidence"
         },
 
         "next_nodes": {
@@ -854,7 +1056,9 @@ curl -X GET "http://localhost:8080/context/v1/query?agent_id=agent_001&session_i
 | `agenttype` | Agent类型标识，如 qa_agent、travel_agent |
 | `version` | 配置版本号，用于配置更新管理 |
 | `workflow` | 工作流定义，包含节点列表、全局上下文、错误处理 |
-| `workflow.nodes` | 节点配置列表，每个节点包含模型配置、上下文需求、路由规则 |
+| `workflow.nodes` | 节点配置列表，每个节点包含模型配置、上下文需求、路由规则、Prompt配置 |
+| `workflow.nodes[].system_prompt` | 节点的System Prompt配置，包含模板ID、内容、变量 |
+| `workflow.nodes[].user_prompt` | 节点的User Prompt配置，包含模板ID、内容、变量，支持条件渲染 |
 | `workflow.global_context` | 全局槽位定义和可见性策略 |
 | `workflow.error_handling` | 节点失败和超时时的处理策略 |
 
@@ -878,27 +1082,107 @@ curl -X GET "http://localhost:8080/context/v1/query?agent_id=agent_001&session_i
 | `meta` | 元数据 | 会话ID、用户ID等元信息 |
 
 
+#### AgentConfig 核心字段
+
+| 字段名 | 说明 | 使用模块 |
+|--------|------|----------|
+| agenttype | Agent类型标识 | 实例管理 |
+| version | 配置版本号 | 实例管理 |
+| workflow | 工作流配置 | 实例管理 |
+| workflow.nodes | 节点配置列表，每个节点包含Prompt配置、上下文需求、路由规则 | 实例管理 |
+| workflow.nodes[].system_prompt | 节点的System Prompt配置 | 实例管理、组装 |
+| workflow.nodes[].user_prompt | 节点的User Prompt配置 | 实例管理、组装 |
+| workflow.global_context | 全局槽位定义和可见性策略 | 实例管理 |
+| workflow.error_handling | 节点失败和超时时的处理策略 | 实例管理 |
+
 
 **数据存储设计**
 
-上下文实例数据采用单表扁平化设计存储在 RAG 服务的关系数据库中。
+上下文数据采用双表设计分离存储：**模板表**（context_template）存储配置元数据，**实例表**（context_instance）存储运行时数据。
 
-### 单表设计
+### 双表设计
 
-通过 `level` 字段区分四级层级，通过 `parent_id` 建立树形关系。
+```
+┌─────────────────────────────────────────────────────────────┐
+│  context_template（模板表）                                  │
+│  - 存储Agent配置模板（每个AgentType一套）                    │
+│  - 数据量小，相对稳定                                        │
+│  - 服务启动时从配置文件加载                                  │
+└─────────────────────────────────────────────────────────────┘
+                             │
+                             │ 复制
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│  context_instance（实例表）                                  │
+│  - 存储运行时实例数据（每个请求创建一套）                    │
+│  - 数据量大，动态增长                                        │
+│  - 可独立分库分表                                            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 模板表（context_template）
+
+存储从配置文件解析的默认模板，作为实例创建的复制源：
 
 ```sql
 -- =============================================
--- 上下文实例统一表（存储在RAG服务的关系库中）
--- 存储 Agent → Session → Task → Model Node 四级层级数据
+-- 上下文模板表
+-- 存储从配置文件加载的默认模板
+-- =============================================
+CREATE TABLE context_template (
+    -- 主键和层级标识
+    id                  VARCHAR(64) PRIMARY KEY COMMENT '模板唯一标识',
+    level               VARCHAR(16) NOT NULL COMMENT '层级: agent/session/task/node',
+    agenttype           VARCHAR(32) NOT NULL COMMENT 'Agent类型',
+
+    -- 各层级的标识（模板使用固定标识）
+    agent_id            VARCHAR(64) COMMENT '模板Agent标识（固定值）',
+    session_id          VARCHAR(64) COMMENT '模板Session标识（固定值）',
+    task_id             VARCHAR(64) COMMENT '模板Task标识（固定值）',
+    node_order          INT COMMENT '执行顺序（仅node层级）',
+
+    -- 层级特定字段
+    session_name        VARCHAR(256) COMMENT '会话名称模板',
+    task_type           VARCHAR(32) COMMENT '任务类型',
+    task_name           VARCHAR(256) COMMENT '任务名称模板',
+    node_type           VARCHAR(32) DEFAULT 'llm' COMMENT '节点类型',
+
+    -- 配置内容（核心字段）
+    model_config        JSON COMMENT '模型配置（含workflow、context_requirements等）',
+    system_prompt       TEXT COMMENT '系统提示词模板',
+    user_prompt         TEXT COMMENT '用户提示词模板',
+
+    -- 版本管理
+    version             VARCHAR(32) DEFAULT '1.0' COMMENT '配置版本号',
+
+    -- 时间戳
+    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    -- 索引
+    INDEX idx_level (level),
+    INDEX idx_agenttype (agenttype),
+    INDEX idx_level_agenttype (level, agenttype),
+    INDEX idx_version (version)
+) COMMENT='上下文模板表';
+```
+
+#### 实例表（context_instance）
+
+存储运行时创建的实例数据，字段与模板表类似但增加运行时字段：
+
+```sql
+-- =============================================
+-- 上下文实例表
+-- 存储从模板复制生成的运行时实例
 -- =============================================
 CREATE TABLE context_instance (
     -- 主键和层级标识
-    id                  VARCHAR(64) PRIMARY KEY COMMENT '节点唯一标识',
+    id                  VARCHAR(64) PRIMARY KEY COMMENT '实例唯一标识',
     level               VARCHAR(16) NOT NULL COMMENT '层级: agent/session/task/node',
-    agenttype           VARCHAR(32) COMMENT 'Agent类型（仅agent层级）',
+    agenttype           VARCHAR(32) COMMENT 'Agent类型',
 
-    -- 各层级的业务标识
+    -- 各层级的业务标识（运行时真实值）
     agent_id            VARCHAR(64) COMMENT '所属Agent ID',
     session_id          VARCHAR(64) COMMENT '所属Session ID',
     task_id             VARCHAR(64) COMMENT '所属Task ID',
@@ -911,23 +1195,22 @@ CREATE TABLE context_instance (
     current_session_id  VARCHAR(64) COMMENT '当前活跃会话ID（仅agent层级）',
 
     -- ===== Session层级字段 =====
-    session_name        VARCHAR(256) COMMENT '会话名称（仅session层级）',
+    session_name        VARCHAR(256) COMMENT '会话名称（实际值）',
 
     -- ===== Task层级字段 =====
-    task_type           VARCHAR(32) COMMENT '任务类型（仅task层级）',
-    task_name           VARCHAR(256) COMMENT '任务名称（仅task层级）',
+    task_type           VARCHAR(32) COMMENT '任务类型',
+    task_name           VARCHAR(256) COMMENT '任务名称（实际值）',
 
     -- ===== Model Node层级字段 =====
-    node_type           VARCHAR(32) DEFAULT 'llm' COMMENT '节点类型（仅node层级）',
-    model_id            VARCHAR(32) COMMENT '模型ID（仅node层级）',
-    model_config        JSON COMMENT '模型配置（仅node层级）',
+    node_type           VARCHAR(32) DEFAULT 'llm' COMMENT '节点类型',
+    model_config        JSON COMMENT '模型配置（从模板复制）',
 
     -- Token消耗
     total_tokens        INT DEFAULT 0 COMMENT '总Token数',
 
     -- ===== 上下文内容（仅node层级） =====
-    system_prompt       TEXT COMMENT '系统提示词',
-    user_prompt         TEXT COMMENT '用户提示词',
+    system_prompt       TEXT COMMENT '系统提示词（渲染后）',
+    user_prompt         TEXT COMMENT '用户提示词模板',
     user_message        TEXT COMMENT '用户原始消息',
     user_original_query TEXT COMMENT '用户原始query',
     user_rewritten_query TEXT COMMENT '用户改写后query',
@@ -935,6 +1218,9 @@ CREATE TABLE context_instance (
     tool_results        JSON COMMENT '工具调用结果',
     dynamic_params      JSON COMMENT '动态参数值',
 
+    -- 关联模板（用于追溯和更新）
+    template_id         VARCHAR(64) COMMENT '来源模板ID',
+    template_version    VARCHAR(32) COMMENT '来源模板版本',
 
     -- 时间戳
     created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -947,16 +1233,71 @@ CREATE TABLE context_instance (
     INDEX idx_agent_id (agent_id),
     INDEX idx_session_id (session_id),
     INDEX idx_task_id (task_id),
-    INDEX idx_model_id (model_id),
     INDEX idx_agenttype (agenttype),
     INDEX idx_status (status),
+    INDEX idx_template_id (template_id),
     INDEX idx_created_at (created_at),
     INDEX idx_level_agent (level, agent_id),
     INDEX idx_level_session (level, session_id),
-    INDEX idx_level_task (level, task_id),
-    INDEX idx_level_model (level, model_id)
-) COMMENT='上下文实例统一表';
+    INDEX idx_level_task (level, task_id)
+) COMMENT='上下文实例表';
 ```
+
+#### context_template 表字段说明
+
+| 字段名 | 类型 | 说明 | 使用模块 |
+|--------|------|------|----------|
+| id | VARCHAR(64) | 模板唯一标识 | 实例管理 |
+| level | VARCHAR(16) | 层级: agent/session/task/node | 实例管理 |
+| agenttype | VARCHAR(32) | Agent类型 | 实例管理 |
+| agent_id | VARCHAR(64) | 模板Agent标识（固定值） | 实例管理 |
+| session_id | VARCHAR(64) | 模板Session标识（固定值） | 实例管理 |
+| task_id | VARCHAR(64) | 模板Task标识（固定值） | 实例管理 |
+| node_order | INT | 执行顺序（仅node层级） | 实例管理 |
+| session_name | VARCHAR(256) | 会话名称模板 | 实例管理 |
+| task_type | VARCHAR(32) | 任务类型 | 实例管理 |
+| task_name | VARCHAR(256) | 任务名称模板 | 实例管理 |
+| node_type | VARCHAR(32) | 节点类型 | 实例管理 |
+| model_config | JSON | 模型配置（含workflow、context_requirements等） | 实例管理、处理、组装 |
+| system_prompt | TEXT | 系统提示词模板 | 实例管理、组装 |
+| user_prompt | TEXT | 用户提示词模板 | 实例管理、组装 |
+| version | VARCHAR(32) | 配置版本号 | 实例管理 |
+| created_at | TIMESTAMP | 创建时间 | 实例管理 |
+| updated_at | TIMESTAMP | 更新时间 | 实例管理 |
+
+#### context_instance 表字段说明
+
+| 字段名 | 类型 | 说明 | 使用模块 |
+|--------|------|------|----------|
+| id | VARCHAR(64) | 实例唯一标识 | 所有模块 |
+| level | VARCHAR(16) | 层级: agent/session/task/node | 实例管理 |
+| agenttype | VARCHAR(32) | Agent类型 | 实例管理 |
+| agent_id | VARCHAR(64) | 所属Agent ID（运行时真实值） | 所有模块 |
+| session_id | VARCHAR(64) | 所属Session ID（运行时真实值） | 所有模块 |
+| task_id | VARCHAR(64) | 所属Task ID（运行时真实值） | 实例管理、数据变更 |
+| node_order | INT | 执行顺序（仅node层级） | 实例管理 |
+| status | VARCHAR(16) | 状态 | 所有模块 |
+| current_session_id | VARCHAR(64) | 当前活跃会话ID（仅agent层级） | 实例管理 |
+| session_name | VARCHAR(256) | 会话名称（实际值） | 实例管理 |
+| task_type | VARCHAR(32) | 任务类型 | 实例管理 |
+| task_name | VARCHAR(256) | 任务名称（实际值） | 实例管理 |
+| node_type | VARCHAR(32) | 节点类型 | 实例管理 |
+| model_config | JSON | 模型配置（从模板复制） | 实例管理、处理、组装 |
+| total_tokens | INT | 总Token数 | 数据变更、处理 |
+| system_prompt | TEXT | 系统提示词（从模板复制） | 实例管理、组装 |
+| user_prompt | TEXT | 用户提示词模板（从模板复制） | 实例管理、组装 |
+| user_message | TEXT | 用户原始消息 | 数据变更 |
+| user_original_query | TEXT | 用户原始query | 数据变更、组装 |
+| user_rewritten_query | TEXT | 用户改写后query | 数据变更、组装 |
+| input_messages | JSON | 输入消息列表 | 数据变更、处理、组装 |
+| tool_results | JSON | 工具调用结果 | 数据变更、处理、组装 |
+| dynamic_params | JSON | 动态参数值 | 数据变更、组装、缓存 |
+| template_id | VARCHAR(64) | 来源模板ID | 实例管理 |
+| template_version | VARCHAR(32) | 来源模板版本 | 实例管理 |
+| created_at | TIMESTAMP | 创建时间 | 所有模块 |
+| updated_at | TIMESTAMP | 更新时间 | 所有模块 |
+| started_at | TIMESTAMP | 开始执行时间 | 实例管理 |
+| completed_at | TIMESTAMP | 完成时间 | 实例管理 |
 
 ### 层级关系示例
 
@@ -979,8 +1320,8 @@ graph TD
 
     C --> F["📄 Task Node<br/>task_mno<br/>level: task"]
 
-    D --> G["⚙️ Model Node<br/>node_001<br/>level: node<br/>model: gpt-4"]
-    D --> H["⚙️ Model Node<br/>node_002<br/>level: node<br/>model: claude-3"]
+    D --> G["⚙️ Model Node<br/>node_001<br/>level: node"]
+    D --> H["⚙️ Model Node<br/>node_002<br/>level: node"]
 
     style A fill:#e1f5fe,stroke:#01579b
     style B fill:#fff8e1,stroke:#ff8f00
@@ -1019,84 +1360,453 @@ ORDER BY node_order;
 
 ### 3.3 上下文数据变更管理模块
 
-**职责**：接收并处理上下文数据的变更请求，触发后续处理流程。
+**职责**：接收 API 网关模块发送的上下文数据变更请求，自动识别数据类型并持久化到 RAG 服务的 `context_instance` 表，同时建立 agent_id、session、task 的层级关系，最后通知上下文组装模块哪些信息发生了变更。
 
-**核心功能**：
-- 接收上下文写入请求
-- 数据格式校验
-- 写入数据到 RAG 服务进行持久化
-- 通知上下文处理模块进行压缩
-- 通知上下文组装模块更新数据
-
-**详细流程**：
-
-```
-接收写入请求 → 数据格式校验 → 数据分类处理 → 持久化到RAG → 触发后续处理
-```
-
-#### 步骤1：接收写入请求
-接收来自 API 网关的上下文写入请求，请求参数包括：
-
-| 参数名 | 类型 | 必填 | 存储字段 |
-|--------|------|------|----------|
-| agent_id | string | 是 | agent_id |
-| session_id | string | 是 | session_id |
-| task_id | string | 否 | task_id |
-| messages | array | 否 | input_messages |
-| tool_results | array | 否 | tool_results |
-| dynamic_params | object | 否 | dynamic_params |
-| metadata | object | 否 | 用于路由判断 |
-
-#### 步骤2：数据格式校验
-- 验证必填字段：agent_id、session_id
-- 验证 messages 格式（role、content、timestamp）
-- 验证 tool_results 格式（tool_id、status、input、output）
-- 验证 agenttype 合法性（sys_agent, qa_agent, travel_agent, shopping_agent, movie_agent）
-
-#### 步骤3：数据分类处理
-根据数据类型决定存储策略：
-
-| 数据类型 | 处理逻辑 | 目标表字段 |
-|----------|----------|------------|
-| 用户消息 | 提取 user_original_query | user_original_query, user_message |
-| 助手回复 | 更新对话历史 | input_messages（追加）|
-| 工具结果 | 结构化存储 | tool_results（追加）|
-| 动态参数 | 合并更新 | dynamic_params（合并）|
-| 改写Query | 存储改写后Query | user_rewritten_query |
-
-#### 步骤4：持久化到RAG
-根据 instance_id 查询已有记录，执行更新操作：
-
-```sql
--- 更新 Node 层级实例的上下文数据
-UPDATE context_instance
-SET
-    input_messages = JSON_MERGE_PATCH(input_messages, ?),
-    tool_results = JSON_MERGE_PATCH(tool_results, ?),
-    dynamic_params = JSON_MERGE_PATCH(dynamic_params, ?),
-    user_message = ?,
-    user_original_query = ?,
-    user_rewritten_query = ?,
-    updated_at = CURRENT_TIMESTAMP
-WHERE id = ? AND level = 'node';
-```
-
-#### 步骤5：触发后续处理
-- **触发压缩流程**：当消息数量超过阈值（如10条）或Token数超过限制时，通知上下文处理模块
-- **触发组装流程**：数据更新完成后，通知上下文组装模块重新组装上下文
-- **记录变更日志**：写入变更历史，用于增量同步
-
-**数据变更事件类型**：
-
-| 事件类型 | 触发条件 | 后续动作 |
-|----------|----------|----------|
-| MESSAGE_ADDED | 新增对话消息 | 通知组装模块 |
-| TOOL_RESULT_ADDED | 新增工具结果 | 通知组装模块 |
-| PARAMS_UPDATED | 动态参数变更 | 通知组装模块 |
-| COMPRESSION_NEEDED | Token超限 | 通知处理模块压缩 |
-| NODE_COMPLETED | 模型节点完成 | 触发下游节点 |
+**模块关系**：
+- **输入**：接收来自 API 网关模块的内部调用（非 REST 接口）
+- **处理**：根据数据内容自动识别操作类型（创建/追加/合并/替换），无需外部指定
+- **输出**：更新 `context_instance` 表，记录层级关系，向上下文组装模块发送变更通知
 
 ---
+
+### 3.3.1 接收数据变更请求
+
+API 网关模块将解析后的数据变更请求发送给本模块，数据变更管理模块不感知操作类型，仅根据数据内容自动处理：
+
+**输入数据结构**：
+
+```json
+{
+  "change_id": "chg_20240308103000001",
+  "timestamp": "2026-03-08T10:30:00.000Z",
+  "source": "api_gateway",
+  "agent_id": "agent_001",
+  "data": {
+    "session": {
+      "session_id": "sess_agent_001_abc123",
+      "session_name": "新会话"
+    },
+    "task": {
+      "task_id": "task_agent_001_xyz789",
+      "task_name": "问答任务",
+      "task_type": "qa"
+    },
+    "node": {
+      "node_id": "intent_recognition",
+      "user_original_query": "今天天气怎么样？",
+      "user_message": "今天天气怎么样？",
+      "input_messages": [
+        {"role": "user", "content": "今天天气怎么样？", "timestamp": "2026-03-08T10:30:00Z"}
+      ],
+      "dynamic_params": {
+        "location": "北京"
+      }
+    }
+  }
+}
+```
+
+**注**：`agent_id` 由实例管理模块预先创建，数据变更模块在此基础上创建 session、task、node。
+
+---
+
+### 3.3.2 自动识别操作类型
+
+数据变更模块根据以下规则自动识别如何处理数据：
+
+| 判断条件 | 自动识别为 | 处理逻辑 |
+|----------|-----------|----------|
+| 记录不存在（按层级标识查询） | **CREATE** | 从 `context_template` 复制创建新记录 |
+| 字段为数组类型（input_messages, tool_results） | **APPEND** | 将新数据追加到数组尾部 |
+| 字段为对象类型（dynamic_params） | **MERGE** | 新旧对象合并，新值覆盖旧值 |
+| 字段为标量类型（session_name, status 等） | **REPLACE** | 直接替换旧值 |
+
+**操作识别伪代码**：
+
+```python
+def auto_detect_operation(existing_record, field_name, new_value):
+    """根据字段类型和现有记录自动识别操作类型"""
+
+    # 1. 检查记录是否存在
+    if existing_record is None:
+        return 'CREATE'
+
+    # 2. 根据字段类型决定操作
+    if field_name in ['input_messages', 'tool_results']:
+        # 数组类型 -> 追加
+        return 'APPEND'
+    elif field_name == 'dynamic_params':
+        # 对象类型 -> 合并
+        return 'MERGE'
+    else:
+        # 标量类型 -> 替换
+        return 'REPLACE'
+
+def process_field(existing_value, new_value, operation):
+    """根据操作类型处理字段值"""
+
+    if operation == 'APPEND':
+        # 数组追加
+        if existing_value is None:
+            return new_value
+        return existing_value + new_value
+
+    elif operation == 'MERGE':
+        # 对象合并
+        if existing_value is None:
+            return new_value
+        return {**existing_value, **new_value}
+
+    elif operation == 'REPLACE':
+        # 直接替换
+        return new_value
+
+    return new_value
+```
+
+---
+
+### 3.3.3 层级关系记录与处理流程
+
+数据变更模块自动维护四级层级关系，确保数据一致性：
+
+```
+接收网关数据
+    ↓
+按层级顺序处理（Session → Task → Node）
+    ↓
+查询是否存在（自动识别 CREATE or UPDATE）
+    ↓
+执行持久化（INSERT or UPDATE）
+    ↓
+记录层级关系变更
+    ↓
+发布变更通知
+```
+
+#### 步骤1：Session 处理
+
+**1.1 查询 Session 是否存在**
+
+```sql
+-- 查询指定 Session 是否已存在
+SELECT id, session_name, status, created_at
+FROM context_instance
+WHERE agent_id = ? AND session_id = ? AND level = 'session';
+```
+
+**1.2 不存在则创建（自动识别为 CREATE）**
+
+```sql
+-- 从模板复制创建新 Session
+INSERT INTO context_instance (
+    id, level, agenttype, agent_id, session_id, session_name,
+    status, template_id, template_version, created_at, updated_at
+)
+SELECT
+    CONCAT('sess_', '{agent_id}', '_', '{session_id}'),
+    'session',
+    (SELECT agenttype FROM context_instance WHERE agent_id = '{agent_id}' AND level = 'agent' LIMIT 1),
+    '{agent_id}',
+    '{session_id}',
+    COALESCE('{session_name}', '新会话'),
+    'active',
+    id,
+    version,
+    NOW(), NOW()
+FROM context_template
+WHERE agenttype = (
+    SELECT agenttype FROM context_instance WHERE agent_id = '{agent_id}' AND level = 'agent' LIMIT 1
+)
+AND level = 'session' AND session_id = 'template';
+```
+
+**1.3 存在则更新（自动识别为 REPLACE）**
+
+```sql
+-- 更新 Session 信息
+UPDATE context_instance
+SET
+    session_name = COALESCE(?, session_name),
+    updated_at = NOW()
+WHERE agent_id = ? AND session_id = ? AND level = 'session';
+```
+
+#### 步骤2：Task 处理
+
+**2.1 查询 Task 是否存在**
+
+```sql
+-- 查询指定 Task 是否已存在
+SELECT id, task_name, task_type, status
+FROM context_instance
+WHERE agent_id = ? AND session_id = ? AND task_id = ? AND level = 'task';
+```
+
+**2.2 不存在则创建（自动识别为 CREATE）**
+
+```sql
+-- 从模板复制创建新 Task
+INSERT INTO context_instance (
+    id, level, agenttype, agent_id, session_id, task_id,
+    task_name, task_type, status, template_id, template_version,
+    created_at, updated_at
+)
+SELECT
+    CONCAT('task_', '{agent_id}', '_', '{session_id}', '_', '{task_id}'),
+    'task',
+    (SELECT agenttype FROM context_instance WHERE agent_id = '{agent_id}' AND level = 'agent' LIMIT 1),
+    '{agent_id}',
+    '{session_id}',
+    '{task_id}',
+    COALESCE('{task_name}', '新任务'),
+    COALESCE('{task_type}', 'default'),
+    'pending',
+    id,
+    version,
+    NOW(), NOW()
+FROM context_template
+WHERE agenttype = (
+    SELECT agenttype FROM context_instance WHERE agent_id = '{agent_id}' AND level = 'agent' LIMIT 1
+)
+AND level = 'task' AND task_id = 'template';
+```
+
+**2.3 存在则更新（自动识别为 REPLACE）**
+
+```sql
+-- 更新 Task 信息
+UPDATE context_instance
+SET
+    task_name = COALESCE(?, task_name),
+    task_type = COALESCE(?, task_type),
+    updated_at = NOW()
+WHERE agent_id = ? AND session_id = ? AND task_id = ? AND level = 'task';
+```
+
+#### 步骤3：Node 处理
+
+**3.1 查询 Node 是否存在**
+
+```sql
+-- 查询指定 Node 是否已存在（通过 node_id 后缀匹配）
+SELECT id, input_messages, tool_results, dynamic_params, status
+FROM context_instance
+WHERE agent_id = ? AND session_id = ? AND task_id = ?
+  AND level = 'node' AND SUBSTRING_INDEX(id, '_', -1) = ?;
+```
+
+**3.2 不存在则创建（自动识别为 CREATE）**
+
+```sql
+-- 从模板复制创建新 Node
+INSERT INTO context_instance (
+    id, level, agenttype, agent_id, session_id, task_id,
+    node_order, node_type, model_config,
+    system_prompt, user_prompt,
+    user_original_query, user_message, input_messages,
+    dynamic_params, total_tokens, status,
+    template_id, template_version,
+    created_at, updated_at
+)
+SELECT
+    CONCAT('node_task_', '{agent_id}', '_', '{session_id}', '_', '{task_id}', '_', '{node_id}'),
+    'node',
+    t.agenttype,
+    '{agent_id}',
+    '{session_id}',
+    '{task_id}',
+    t.node_order,
+    t.node_type,
+    t.model_config,
+    t.system_prompt,
+    t.user_prompt,
+    ?,  -- user_original_query
+    ?,  -- user_message
+    ?,  -- input_messages (JSON)
+    ?,  -- dynamic_params (JSON)
+    0,  -- total_tokens 初始为0
+    'active',
+    t.id,
+    t.version,
+    NOW(), NOW()
+FROM context_template t
+WHERE t.agenttype = (
+    SELECT agenttype FROM context_instance WHERE agent_id = '{agent_id}' AND level = 'agent' LIMIT 1
+)
+AND t.level = 'node'
+AND t.task_id = 'template'
+AND SUBSTRING_INDEX(t.id, '_', -1) = '{node_id}';
+```
+
+**3.3 存在则更新（自动识别 APPEND/MERGE/REPLACE）**
+
+根据传入的字段自动选择更新方式：
+
+```sql
+-- 动态构建 UPDATE 语句（伪代码表示）
+UPDATE context_instance
+SET
+    -- 数组字段：追加
+    input_messages = CASE WHEN ? IS NOT NULL
+        THEN JSON_MERGE_PATCH(
+            COALESCE(input_messages, JSON_ARRAY()),
+            CAST(? AS JSON)
+        )
+        ELSE input_messages
+    END,
+
+    -- 数组字段：追加
+    tool_results = CASE WHEN ? IS NOT NULL
+        THEN JSON_MERGE_PATCH(
+            COALESCE(tool_results, JSON_ARRAY()),
+            CAST(? AS JSON)
+        )
+        ELSE tool_results
+    END,
+
+    -- 对象字段：合并
+    dynamic_params = CASE WHEN ? IS NOT NULL
+        THEN JSON_MERGE_PATCH(
+            COALESCE(dynamic_params, JSON_OBJECT()),
+            CAST(? AS JSON)
+        )
+        ELSE dynamic_params
+    END,
+
+    -- 标量字段：替换
+    user_original_query = COALESCE(?, user_original_query),
+    user_rewritten_query = COALESCE(?, user_rewritten_query),
+    user_message = COALESCE(?, user_message),
+    total_tokens = COALESCE(?, total_tokens),
+
+    updated_at = NOW()
+WHERE agent_id = ? AND session_id = ? AND task_id = ?
+  AND level = 'node' AND SUBSTRING_INDEX(id, '_', -1) = ?;
+```
+
+---
+
+### 3.3.4 变更检测与通知
+
+数据持久化完成后，分析变更内容并通知上下文组装模块：
+
+**变更检测逻辑**：
+
+```python
+def detect_changes(old_record, new_data):
+    """检测哪些字段发生了变化"""
+    changes = []
+
+    for field_name, new_value in new_data.items():
+        old_value = old_record.get(field_name) if old_record else None
+
+        # 检测变化
+        if old_value is None and new_value is not None:
+            changes.append({'field': field_name, 'type': 'CREATED', 'old': None, 'new': new_value})
+        elif old_value != new_value:
+            if isinstance(new_value, list):
+                changes.append({'field': field_name, 'type': 'APPENDED', 'old': old_value, 'new': new_value})
+            elif isinstance(new_value, dict):
+                changes.append({'field': field_name, 'type': 'MERGED', 'old': old_value, 'new': new_value})
+            else:
+                changes.append({'field': field_name, 'type': 'REPLACED', 'old': old_value, 'new': new_value})
+
+    return changes
+```
+
+**通知数据结构**：
+
+```json
+{
+  "change_id": "chg_20240308103000001",
+  "timestamp": "2026-03-08T10:30:01.234Z",
+  "agent_id": "agent_001",
+  "hierarchy": {
+    "agent_id": "agent_001",
+    "session_id": "sess_agent_001_abc123",
+    "task_id": "task_agent_001_xyz789",
+    "node_id": "intent_recognition"
+  },
+  "changes": [
+    {
+      "level": "session",
+      "session_id": "sess_agent_001_abc123",
+      "change_type": "CREATED",
+      "fields": [{"name": "session_name", "type": "CREATED"}]
+    },
+    {
+      "level": "task",
+      "task_id": "task_agent_001_xyz789",
+      "change_type": "CREATED",
+      "fields": [
+        {"name": "task_name", "type": "CREATED"},
+        {"name": "task_type", "type": "CREATED"}
+      ]
+    },
+    {
+      "level": "node",
+      "node_id": "intent_recognition",
+      "change_type": "MULTI",
+      "fields": [
+        {"name": "input_messages", "type": "APPENDED", "count": 1},
+        {"name": "dynamic_params", "type": "MERGED", "keys": ["location"]},
+        {"name": "user_original_query", "type": "CREATED"}
+      ],
+      "needs_assembly": true
+    }
+  ],
+  "assembly_hint": {
+    "target_node": "intent_recognition",
+    "reason": "user_input_added",
+    "affected_fields": ["input_messages", "dynamic_params"]
+  }
+}
+```
+
+**通知发送逻辑**：
+
+```python
+def notify_assembly_module(change_summary):
+    """通知上下文组装模块哪些信息发生了变更"""
+
+    # 提取需要组装的 Node 变更
+    node_changes = [
+        c for c in change_summary['changes']
+        if c['level'] == 'node' and c.get('needs_assembly', False)
+    ]
+
+    if node_changes:
+        # 发送给上下文组装模块
+        assembly_service.on_context_changed({
+            'change_id': change_summary['change_id'],
+            'agent_id': change_summary['agent_id'],
+            'hierarchy': change_summary['hierarchy'],
+            'node_changes': node_changes,
+            'priority': 'high'  # 用户输入需要高优先级处理
+        })
+
+    # 发送给缓存同步模块
+    cache_sync_service.on_context_changed(change_summary)
+```
+
+---
+
+### 3.3.5 数据变更事件类型
+
+| 事件 | 自动识别条件 | 通知对象 | 处理动作 |
+|------|-------------|----------|----------|
+| **SESSION_CREATED** | Session 记录不存在，执行 INSERT | 缓存模块 | 初始化会话上下文缓存 |
+| **TASK_CREATED** | Task 记录不存在，执行 INSERT | 缓存模块 | 初始化任务上下文缓存 |
+| **NODE_CREATED** | Node 记录不存在，执行 INSERT | 组装模块 | 准备 Node 执行上下文 |
+| **MESSAGES_APPENDED** | `input_messages` 数组追加 | 组装模块 | 重新组装上下文 |
+| **TOOL_RESULTS_APPENDED** | `tool_results` 数组追加 | 组装模块 | 将结果加入上下文 |
+| **PARAMS_MERGED** | `dynamic_params` 对象合并 | 组装模块 | 重新渲染 Prompt |
+| **FIELD_REPLACED** | 标量字段被替换 | 视字段而定 | 视具体字段处理 |
+| **RECORD_UPDATED** | 任意字段更新 | 缓存模块 | 同步更新到缓存 |
+
+---
+
 
 ### 3.4 上下文处理模块
 
@@ -1522,7 +2232,6 @@ public:
 
 ---
 
-
 ### 3.5 上下文组装模块
 
 **职责**：根据 LLM 的需求，组装完整的上下文数据。
@@ -1611,7 +2320,6 @@ LIMIT ?;
 
 ```json
 {
-  "model_id": "gpt-4",
   "messages": [
     {"role": "system", "content": "{{system_prompt}}"},
     {"role": "user", "content": "{{user_prompt}}"},
@@ -1916,8 +2624,10 @@ SysAgent
 │              RAG服务                     │
 │  ┌─────────────────────────────────────┐ │
 │  │  关系数据库（内置）                  │ │
+│  │  - context_template 表              │ │
+│  │    （模板表，存储配置元数据）        │ │
 │  │  - context_instance 表              │ │
-│  │  - 单表存储四级层级数据              │ │
+│  │    （实例表，存储运行时数据）        │ │
 │  └─────────────────────────────────────┘ │
 │  ┌─────────────────────────────────────┐ │
 │  │  向量数据库                          │ │
@@ -1935,52 +2645,3 @@ SysAgent
 
 *文档版本：v1.1*
 *最后更新：2026-03-08*
-
-## 附录：数据库表配置参考
-
-### context_instance 表字段说明
-
-| 字段名 | 类型 | 说明 | 使用模块 |
-|--------|------|------|----------|
-| id | VARCHAR(64) | 节点唯一标识 | 所有模块 |
-| level | VARCHAR(16) | 层级: agent/session/task/node | 实例管理 |
-| agenttype | VARCHAR(32) | Agent类型 | 实例管理 |
-| agent_id | VARCHAR(64) | 所属Agent ID | 所有模块 |
-| session_id | VARCHAR(64) | 所属Session ID | 所有模块 |
-| task_id | VARCHAR(64) | 所属Task ID | 实例管理、数据变更 |
-| node_order | INT | 执行顺序（仅node层级） | 实例管理 |
-| status | VARCHAR(16) | 状态 | 所有模块 |
-| current_session_id | VARCHAR(64) | 当前活跃会话ID（仅agent层级） | 实例管理 |
-| session_name | VARCHAR(256) | 会话名称（仅session层级） | 实例管理 |
-| task_type | VARCHAR(32) | 任务类型（仅task层级） | 实例管理 |
-| task_name | VARCHAR(256) | 任务名称（仅task层级） | 实例管理 |
-| node_type | VARCHAR(32) | 节点类型（仅node层级） | 实例管理 |
-| model_id | VARCHAR(32) | 模型ID（仅node层级） | 实例管理、组装 |
-| model_config | JSON | 模型配置（仅node层级） | 实例管理、处理、组装 |
-| total_tokens | INT | 总Token数 | 数据变更、处理 |
-| system_prompt | TEXT | 系统提示词 | 实例管理、组装 |
-| user_prompt | TEXT | 用户提示词 | 实例管理、组装 |
-| user_message | TEXT | 用户原始消息 | 数据变更 |
-| user_original_query | TEXT | 用户原始query | 数据变更、组装 |
-| user_rewritten_query | TEXT | 用户改写后query | 数据变更、组装 |
-| input_messages | JSON | 输入消息列表 | 数据变更、处理、组装 |
-| tool_results | JSON | 工具调用结果 | 数据变更、处理、组装 |
-| dynamic_params | JSON | 动态参数值 | 数据变更、组装、缓存 |
-| created_at | TIMESTAMP | 创建时间 | 所有模块 |
-| updated_at | TIMESTAMP | 更新时间 | 所有模块 |
-| started_at | TIMESTAMP | 开始执行时间 | 实例管理 |
-| completed_at | TIMESTAMP | 完成时间 | 实例管理 |
-
-## 附录：配置模型参考
-
-### AgentConfig 核心字段
-
-| 字段名 | 说明 | 使用模块 |
-|--------|------|----------|
-| agenttype | Agent类型标识 | 实例管理 |
-| version | 配置版本号 | 实例管理 |
-| model_orchestration | 模型编排配置 | 实例管理 |
-| prompt_templates | Prompt模板库 | 实例管理、组装 |
-| parameters | 参数定义 | 实例管理、组装 |
-| context_slots | 上下文槽位定义 | 实例管理、组装 |
-| workflow | 工作流配置 | 实例管理 |
